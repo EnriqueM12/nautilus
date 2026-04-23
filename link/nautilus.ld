@@ -120,6 +120,7 @@ SECTIONS
     
     /DISCARD/ :
     {
+        *(.note.gnu.property)
         *(.comment)
         *(.eh_frame)
     }

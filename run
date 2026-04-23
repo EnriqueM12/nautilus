@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+if [ $HOSTNAME == "moore.wot.ece.northwestern.edu" ]; then
+    echo "Running on moore"
+else
+    echo "NOT running on moore (running on " $HOSTNAME ")"
+    echo "You can do this, but you will need to edit this script"
+    echo "and should be aware there are other caveats."
+    # exit
+fi
+
+# select version of qemu by path, instead of hardcoding
+#export PATH=/home/software/qemu4/bin:$PATH
+# export PATH=~pdinda/HANDOUT/tools/bin:$PATH
+
+# Exit on any errors
+set -e
+
+# make the root filesystem (lfs)
+#make ramdisk.img
+
+# hack: delete `src/asm/ramdisk.o` so the root filesystem gets updated (we use a RAM filesystem to avoid complications)
+rm -f src/asm/ramdisk.o
+
+# build the kernel and the isoimage for it
+make isoimage -j 8
+
+# make exact wtfs-sized nvme, hopefully functional
+# dd if=/dev/zero of=nvmsmall.img bs=512 count=4356
+
+echo "I am using" `which qemu-system-x86_64`
+
+# Run the kernel in QEMU with some default arguments and devices.
+qemu-system-x86_64 \
+    \
+    -machine q35,cxl=on  \
+    -m 4G,slots=8,maxmem=8G \
+    -smp 1 \
+    \
+    -drive file=nautilus.iso,media=cdrom,id=cd,format=raw,if=none \
+    -device ide-cd,drive=cd,bootindex=0  \
+    \
+    -drive file=nvmsmall.img,if=none,id=nvm,format=raw \
+    -device nvme,serial=deadbeef,drive=nvm \
+    \
+    -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/tmp/cxltest.raw,size=256M \
+    -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/tmp/lsa.raw,size=256M \
+    -device pxb-cxl,bus_nr=12,bus=pcie.0,id=cxl.1 \
+    -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
+    -device cxl-type3,bus=root_port13,memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-pmem0,sn=01 \
+    \
+    -serial stdio -vga std \
+    \
+    -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
+    \
+    -D qemu.log 
+    \xs
+    $@
+
+# -device cxl-type3,bus=root_port13,volatile-memdev=vmem0,id=cxl-vmem0 \
+# -object memory-backend-ram,id=vmem0,share=on,size=256M \
+
+# vestigal nvme debug
+#-d guest_errors -trace "nvme*"     
