@@ -49,7 +49,11 @@ qemu-system-x86_64 \
     -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
     -device cxl-type3,bus=root_port13,memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-pmem0,sn=01 \
     \
-    -serial stdio -vga std \
+    -chardev socket,host=localhost,port=5000,id=g,server,wait=off \
+    -device isa-serial,chardev=g \
+    -chardev stdio,id=d \
+    -device isa-serial,chardev=d \
+    -vga std \
     \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
     \

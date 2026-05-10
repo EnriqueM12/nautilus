@@ -222,6 +222,20 @@ config DEBUG_MLX3_PCI
     help
       Turn on debug prints for the Mellanox ConnectX-3 HCA Driver
 
+config CXL
+    bool "CXL Type 3 Device Driver"
+    depends on X86_64_HOST
+    default n
+    help
+      Adds a driver for CXL Type 3 memory expander devices.
+      Detects CXL devices on the PCI bus and maps their BARs.
+
+config DEBUG_CXL
+    bool "Debug CXL"
+    depends on DEBUG_PRINTS && CXL
+    default n
+    help
+      Turn on debug prints for the CXL driver
 
 config RAMDISK
     bool "RAM Disk Support"
