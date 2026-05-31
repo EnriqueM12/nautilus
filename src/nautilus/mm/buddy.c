@@ -194,9 +194,10 @@ find_buddy (struct buddy_mempool *mp, struct block *block, ulong_t order)
 
 
 struct buddy_mempool *
-buddy_init (ulong_t base_addr,
-            ulong_t pool_order,
-            ulong_t min_order)
+buddy_init_alloc (ulong_t base_addr,
+                  ulong_t pool_order,
+                  ulong_t min_order,
+                  void *(*alloc_fn)(ulong_t))
 {
     struct buddy_mempool *mp;
     ulong_t i;
@@ -215,7 +216,7 @@ buddy_init (ulong_t base_addr,
         return NULL;
     }
 
-    mp = mm_boot_alloc(sizeof(struct buddy_mempool));
+    mp = alloc_fn(sizeof(struct buddy_mempool));
     if (!mp) {
         ERROR_PRINT("Could not allocate mempool\n");
         return NULL;
@@ -227,13 +228,12 @@ buddy_init (ulong_t base_addr,
     mp->min_order  = min_order;
 
     /* Allocate a list for every order up to the maximum allowed order */
-    mp->avail = mm_boot_alloc((pool_order + 1) * sizeof(struct list_head));
+    mp->avail = alloc_fn((pool_order + 1) * sizeof(struct list_head));
 
-    if (!mp->avail) { 
+    if (!mp->avail) {
 	ERROR_PRINT("Cannot allocate list heads\n");
 	return NULL;
     }
-
 
     /* Initially all lists are empty */
     for (i = 0; i <= pool_order; i++) {
@@ -242,9 +242,9 @@ buddy_init (ulong_t base_addr,
 
     /* Allocate a bitmap with 1 bit per minimum-sized block */
     mp->num_blocks = (1UL << pool_order) / (1UL << min_order);
-    mp->tag_bits   = mm_boot_alloc(BITS_TO_LONGS(mp->num_blocks) * sizeof(long));
+    mp->tag_bits   = alloc_fn(BITS_TO_LONGS(mp->num_blocks) * sizeof(long));
 
-    if (!mp->tag_bits) { 
+    if (!mp->tag_bits) {
 	ERROR_PRINT("Could not allocate bitmap for mempool\n");
 	return NULL;
     }
@@ -258,6 +258,15 @@ buddy_init (ulong_t base_addr,
     BUDDY_DEBUG("Created memory pool %p\n",mp);
 
     return mp;
+}
+
+struct buddy_mempool *
+buddy_init (ulong_t base_addr,
+            ulong_t pool_order,
+            ulong_t min_order)
+{
+    return buddy_init_alloc(base_addr, pool_order, min_order,
+                            (void *(*)(ulong_t))mm_boot_alloc);
 }
 
 

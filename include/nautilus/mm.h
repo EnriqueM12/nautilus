@@ -91,6 +91,7 @@ struct mem_region;
 
 struct mem_region * kmem_get_base_zone(void);
 struct mem_region * kmem_get_region_by_addr(ulong_t addr);
+int  kmem_create_zone(struct mem_region *region);
 void kmem_add_memory(struct mem_region * mem, ulong_t base_addr, size_t size);
 
 // this the range of heap addresses used by the boot allocator [low,high)
