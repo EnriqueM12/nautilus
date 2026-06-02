@@ -230,6 +230,16 @@ config CXL
       Adds a driver for CXL Type 3 memory expander devices.
       Detects CXL devices on the PCI bus and maps their BARs.
 
+config CXL_AUTO_INIT_HDM
+    bool "Automatically program CXL HDM decoders at boot"
+    depends on CXL
+    default y
+    help
+      When enabled, CXL HDM decoders are programmed automatically during
+      driver init and CXL device memory is registered with the buddy
+      allocator. When disabled, use the 'cxl hdm program' shell command
+      to do this manually.
+
 config DEBUG_CXL
     bool "Debug CXL"
     depends on DEBUG_PRINTS && CXL

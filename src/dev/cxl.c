@@ -451,6 +451,8 @@ struct cedt_cfmws {
 static uint64_t cedt_fmw_base = 0;
 static uint64_t cedt_fmw_size = 0;
 
+static struct numa_domain *cxl_numa_dom = NULL;
+
 #define CEDT_MAX_HBS 4
 static uint64_t cedt_hb_base[CEDT_MAX_HBS];
 static int      cedt_num_hbs = 0;
@@ -1535,6 +1537,8 @@ static int probe_function(uint8_t bus, uint8_t slot, uint8_t fun)
  * Init / deinit
  * ----------------------------------------------------------------------- */
 
+static void cxl_program_all_hdm(uint64_t hpa_base);
+
 int cxl_init(struct naut_info *naut)
 {
     INFO("init\n");
@@ -1568,8 +1572,14 @@ int cxl_init(struct naut_info *naut)
         }
     }
 
-    if (list_empty(&dev_list))
+    if (list_empty(&dev_list)) {
         INFO("No CXL devices found\n");
+        return 0;
+    }
+
+#ifdef NAUT_CONFIG_CXL_AUTO_INIT_HDM
+    cxl_program_all_hdm(cedt_fmw_base ? cedt_fmw_base : CXL_HDM_DEFAULT_HPA_BASE);
+#endif
 
     return 0;
 }
@@ -1583,6 +1593,143 @@ int cxl_deinit(void)
         free(dev);
     }
     return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * HDM programming — program all discovered devices and register with kmem
+ * ----------------------------------------------------------------------- */
+
+static void cxl_program_all_hdm(uint64_t hpa_base)
+{
+    struct list_head *cur;
+    int hb_dec_idx = 0;
+    struct sys_info *sys = &(nk_get_nautilus_info()->sys);
+
+    /* Create a dedicated NUMA domain for CXL memory so the allocator
+     * treats it as a remote tier, preferring DRAM first. */
+    struct numa_domain *cxl_dom = NULL;
+    unsigned cxl_dom_id = nk_get_num_domains();
+    if (cxl_dom_id < MAX_NUMA_DOMAINS) {
+        cxl_dom = kmem_malloc(sizeof(*cxl_dom));
+        if (cxl_dom) {
+            memset(cxl_dom, 0, sizeof(*cxl_dom));
+            cxl_dom->id = cxl_dom_id;
+            INIT_LIST_HEAD(&cxl_dom->regions);
+            INIT_LIST_HEAD(&cxl_dom->adj_list);
+            sys->locality_info.domains[cxl_dom_id] = cxl_dom;
+            sys->locality_info.num_domains++;
+            cxl_numa_dom = cxl_dom;
+            INFO("CXL NUMA domain %u created\n", cxl_dom_id);
+        } else {
+            ERROR("Failed to allocate CXL NUMA domain\n");
+        }
+    } else {
+        ERROR("MAX_NUMA_DOMAINS reached — CXL domain not created\n");
+    }
+
+    list_for_each(cur, &dev_list) {
+        struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+
+        if (!dev->total_mb) {
+            INFO("[%02x:%02x.%x] total_mb=0 — skipping HDM programming\n",
+                 dev->bus, dev->slot, dev->fun);
+            continue;
+        }
+
+        uint64_t hpa_size = (uint64_t)dev->total_mb << 20;
+        int is_pmem = dev->persistent_mb > 0;
+
+        /* Find the root port for this endpoint by scanning for a bridge
+         * whose secondary bus matches the device's bus number. */
+        uint8_t rp_slot = 0xff;
+        for (int r2 = 0; r2 < num_ecam_regions && rp_slot == 0xff; r2++) {
+            for (int b2 = ecam_regions[r2].start_bus;
+                 b2 <= ecam_regions[r2].end_bus && rp_slot == 0xff; b2++) {
+                for (int s2 = 0; s2 < 32 && rp_slot == 0xff; s2++) {
+                    uint32_t id2 = ecam_readl(b2, s2, 0, PCI_CFG_VENDOR);
+                    if ((id2 & 0xffff) == PCI_VENDOR_NONE) continue;
+                    uint32_t cls2 = ecam_readl(b2, s2, 0, PCI_CFG_CLASS);
+                    if (((cls2 >> 24) & 0xff) != 0x06) continue;
+                    uint8_t sec2 = (ecam_readl(b2, s2, 0, PCI_CFG_SEC_BUS) >> 8) & 0xff;
+                    if (sec2 == dev->bus)
+                        rp_slot = (uint8_t)s2;
+                }
+            }
+        }
+
+        INFO("[%02x:%02x.%x] programming decoder[0]: "
+             "hpa=0x%016llx size=0x%016llx (%lluMB) type=%s rp_slot=%u\n",
+             dev->bus, dev->slot, dev->fun,
+             hpa_base, hpa_size, dev->total_mb,
+             is_pmem ? "pmem" : "volatile",
+             rp_slot == 0xff ? 255 : rp_slot);
+
+        if (rp_slot != 0xff)
+            cxl_program_host_bridge_decoder(hb_dec_idx++, hpa_base, hpa_size, rp_slot);
+
+        if (cxl_hdm_program_decoder(dev, 0, hpa_base, hpa_size, is_pmem) == 0) {
+            struct mem_region *mr = kmem_malloc(sizeof(*mr));
+            if (!mr) {
+                ERROR("[%02x:%02x.%x] kmem_malloc for mem_region failed\n",
+                      dev->bus, dev->slot, dev->fun);
+            } else {
+                memset(mr, 0, sizeof(*mr));
+                mr->base_addr     = hpa_base;
+                mr->len           = hpa_size;
+                mr->enabled       = 1;
+                mr->hot_pluggable = 1;
+                mr->nonvolatile   = is_pmem;
+                INIT_LIST_HEAD(&mr->entry);
+                INIT_LIST_HEAD(&mr->glob_link);
+
+                cxl_mem_map(hpa_base, hpa_size);
+
+                if (kmem_create_zone(mr) < 0) {
+                    ERROR("[%02x:%02x.%x] kmem_create_zone failed\n",
+                          dev->bus, dev->slot, dev->fun);
+                    kmem_free(mr);
+                } else {
+                    kmem_add_memory(mr, hpa_base, hpa_size);
+                    dev->kmem_region = mr;
+                    INFO("[%02x:%02x.%x] registered %lluMB at 0x%016llx with kmem\n",
+                         dev->bus, dev->slot, dev->fun, hpa_size >> 20, hpa_base);
+
+                    /* Associate region with the CXL NUMA domain. */
+                    if (cxl_dom) {
+                        mr->domain_id = cxl_dom_id;
+                        list_add_tail(&mr->entry, &cxl_dom->regions);
+                        cxl_dom->addr_space_size += hpa_size;
+                        cxl_dom->num_regions++;
+                    }
+                }
+            }
+            hpa_base += hpa_size;
+        }
+    }
+
+    /* Wire CXL domain into every existing domain's adjacency list (at the
+     * tail = farthest), and wire existing domains into the CXL domain's
+     * adjacency list so distance-ordered traversal works both ways. */
+    if (cxl_dom && cxl_dom->num_regions > 0) {
+        for (unsigned i = 0; i < cxl_dom_id; i++) {
+            struct numa_domain *d = sys->locality_info.domains[i];
+            if (!d) continue;
+
+            struct domain_adj_entry *fwd = kmem_malloc(sizeof(*fwd));
+            if (fwd) {
+                fwd->domain = cxl_dom;
+                list_add_tail(&fwd->list_ent, &d->adj_list);
+            }
+
+            struct domain_adj_entry *rev = kmem_malloc(sizeof(*rev));
+            if (rev) {
+                rev->domain = d;
+                list_add_tail(&rev->list_ent, &cxl_dom->adj_list);
+            }
+        }
+        INFO("CXL NUMA domain %u: %u region(s) %lluMB wired into topology\n",
+             cxl_dom_id, cxl_dom->num_regions, cxl_dom->addr_space_size >> 20);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -1977,94 +2124,11 @@ static int handle_cxl(char *buf, void *priv)
     }
 
     if (!strncmp(buf, "cxl hdm program", 15)) {
-        /* Assign HPA windows sequentially from hpa_base.
-         * Usage: cxl hdm program [<hpa_base_hex>]
-         * Default: CEDT-discovered FMW base, or fallback constant. */
         uint64_t hpa_base = cedt_fmw_base ? cedt_fmw_base : CXL_HDM_DEFAULT_HPA_BASE;
         if (buf[15] == ' ')
             sscanf(buf + 16, "%llx", &hpa_base);
-
-        int hb_dec_idx = 0;  /* next available host bridge decoder slot */
-
-        list_for_each(cur, &dev_list) {
-            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
-            count++;
-
-            if (!dev->total_mb) {
-                nk_vc_printf("[%02x:%02x.%x] total_mb=0 — run cxl identify first\n",
-                             dev->bus, dev->slot, dev->fun);
-                continue;
-            }
-
-            uint64_t hpa_size = (uint64_t)dev->total_mb << 20;
-            int is_pmem = dev->persistent_mb > 0;
-
-            /* Find the root port for this endpoint to get the target port number.
-             * The root port's slot on the CXL bus is its port number. */
-            uint8_t rp_slot = 0xff;
-            {
-                int r2;
-                for (r2 = 0; r2 < num_ecam_regions && rp_slot == 0xff; r2++) {
-                    int b2;
-                    for (b2 = ecam_regions[r2].start_bus;
-                         b2 <= ecam_regions[r2].end_bus && rp_slot == 0xff; b2++) {
-                        int s2;
-                        for (s2 = 0; s2 < 32 && rp_slot == 0xff; s2++) {
-                            uint32_t id2 = ecam_readl(b2, s2, 0, PCI_CFG_VENDOR);
-                            if ((id2 & 0xffff) == PCI_VENDOR_NONE) continue;
-                            uint32_t cls2 = ecam_readl(b2, s2, 0, PCI_CFG_CLASS);
-                            if (((cls2 >> 24) & 0xff) != 0x06) continue;
-                            uint8_t sec2 = (ecam_readl(b2, s2, 0, PCI_CFG_SEC_BUS) >> 8) & 0xff;
-                            if (sec2 == dev->bus)
-                                rp_slot = (uint8_t)s2;
-                        }
-                    }
-                }
-            }
-
-            nk_vc_printf("[%02x:%02x.%x] programming decoder[0]: "
-                         "hpa=0x%016llx size=0x%016llx (%lluMB) type=%s rp_slot=%u\n",
-                         dev->bus, dev->slot, dev->fun,
-                         hpa_base, hpa_size, dev->total_mb,
-                         is_pmem ? "pmem" : "volatile",
-                         rp_slot == 0xff ? 255 : rp_slot);
-
-            /* Program host bridge decoder for this endpoint's HPA range,
-             * targeting the root port slot that leads to this device. */
-            if (rp_slot != 0xff)
-                cxl_program_host_bridge_decoder(hb_dec_idx++, hpa_base, hpa_size, rp_slot);
-
-            if (cxl_hdm_program_decoder(dev, 0, hpa_base, hpa_size, is_pmem) == 0) {
-
-                /* Register committed HPA range with Nautilus's kmem allocator. */
-                struct mem_region *mr = kmem_malloc(sizeof(*mr));
-                if (!mr) {
-                    nk_vc_printf("  kmem_malloc for mem_region failed\n");
-                } else {
-                    memset(mr, 0, sizeof(*mr));
-                    mr->base_addr    = hpa_base;
-                    mr->len          = hpa_size;
-                    mr->enabled      = 1;
-                    mr->hot_pluggable = 1;
-                    mr->nonvolatile  = is_pmem;
-                    INIT_LIST_HEAD(&mr->entry);
-                    INIT_LIST_HEAD(&mr->glob_link);
-
-                    cxl_mem_map(hpa_base, hpa_size);
-
-                    if (kmem_create_zone(mr) < 0) {
-                        nk_vc_printf("  kmem_create_zone failed\n");
-                        kmem_free(mr);
-                    } else {
-                        kmem_add_memory(mr, hpa_base, hpa_size);
-                        dev->kmem_region = mr;
-                        nk_vc_printf("  registered %lluMB at 0x%016llx with kmem\n",
-                                     hpa_size >> 20, hpa_base);
-                    }
-                }
-                hpa_base += hpa_size;   /* advance window for next device */
-            }
-        }
+        cxl_program_all_hdm(hpa_base);
+        list_for_each(cur, &dev_list) { count++; }
         if (!count) nk_vc_printf("No CXL devices\n");
         return 0;
     }
@@ -2075,6 +2139,27 @@ static int handle_cxl(char *buf, void *priv)
                          cedt_fmw_base, cedt_fmw_size);
         else
             nk_vc_printf("No CXL FMW found in CEDT (or CEDT not present)\n");
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl numa", 8)) {
+        if (!cxl_numa_dom) {
+            nk_vc_printf("CXL NUMA domain not created (run cxl hdm program first)\n");
+        } else {
+            nk_vc_printf("CXL NUMA domain %u: %u region(s) %lluMB\n",
+                         cxl_numa_dom->id, cxl_numa_dom->num_regions,
+                         cxl_numa_dom->addr_space_size >> 20);
+            struct mem_region *mr;
+            list_for_each_entry(mr, &cxl_numa_dom->regions, entry) {
+                nk_vc_printf("  base=0x%016llx len=%lluMB domain=%u\n",
+                             mr->base_addr, mr->len >> 20, mr->domain_id);
+            }
+            struct domain_adj_entry *ent;
+            nk_vc_printf("  adj_list (DRAM domains):");
+            list_for_each_entry(ent, &cxl_numa_dom->adj_list, list_ent)
+                nk_vc_printf(" %u", ent->domain->id);
+            nk_vc_printf("\n");
+        }
         return 0;
     }
 
@@ -2192,6 +2277,7 @@ static int handle_cxl(char *buf, void *priv)
         "  cxl sanitize             sanitize overwrite (background op)\n"
         "  cxl security             get security state\n"
         "  cxl cedt                 show CXL FMW base from ACPI CEDT\n"
+        "  cxl numa                 show CXL NUMA domain info\n"
         "  cxl hdm                  dump HDM decoder state\n"
         "  cxl hdm program [<base>] program decoder[0] on each device\n"
         "                           (default: CEDT FMW base or 0x100000000)\n"
