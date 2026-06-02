@@ -2258,6 +2258,116 @@ static int handle_cxl(char *buf, void *priv)
         return 0;
     }
 
+    if (!strncmp(buf, "cxl mem stress", 14)) {
+        /* Allocate 1MB chunks until the allocator falls back to CXL */
+#define STRESS_MAX 4096
+        void **ptrs = kmem_malloc(STRESS_MAX * sizeof(void *));
+        if (!ptrs) {
+            nk_vc_printf("failed to allocate pointer table\n");
+            return 0;
+        }
+        memset(ptrs, 0, STRESS_MAX * sizeof(void *));
+        int n = 0, first_cxl = -1;
+        nk_vc_printf("allocating 1MB chunks until CXL fallback (max %d)...\n", STRESS_MAX);
+        for (n = 0; n < STRESS_MAX; n++) {
+            ptrs[n] = malloc(1 << 20);
+            if (!ptrs[n]) {
+                nk_vc_printf("OOM at allocation %d\n", n);
+                break;
+            }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[n]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) { first_cxl = n; n++; break; }
+        }
+        if (first_cxl < 0)
+            nk_vc_printf("no CXL fallback in %d allocations (%dMB) — DRAM not exhausted or no CXL registered\n",
+                         n, n);
+        else
+            nk_vc_printf("DRAM exhausted after %d x 1MB (%dMB), first CXL ptr=%p: OK\n",
+                         first_cxl, first_cxl, ptrs[first_cxl]);
+        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        kmem_free(ptrs);
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl mem isolate", 15)) {
+        /* Verify that CXL alloc/free does not corrupt DRAM allocations */
+#define ISOLATE_MAX 4096
+        void **ptrs = kmem_malloc(ISOLATE_MAX * sizeof(void *));
+        if (!ptrs) {
+            nk_vc_printf("failed to allocate pointer table\n");
+            return 0;
+        }
+        memset(ptrs, 0, ISOLATE_MAX * sizeof(void *));
+        int n = 0, first_cxl = -1;
+        void *cxl_ptr = NULL;
+
+        nk_vc_printf("phase 1: exhausting DRAM to obtain a CXL allocation...\n");
+        for (n = 0; n < ISOLATE_MAX; n++) {
+            ptrs[n] = malloc(1 << 20);
+            if (!ptrs[n]) { nk_vc_printf("  OOM at %d\n", n); break; }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[n]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) { first_cxl = n; cxl_ptr = ptrs[n]; n++; break; }
+        }
+        if (first_cxl < 0) {
+            nk_vc_printf("  could not obtain CXL allocation — test skipped\n");
+            for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+            kmem_free(ptrs);
+            return 0;
+        }
+        nk_vc_printf("  CXL block at %p after %d DRAM allocations\n", cxl_ptr, first_cxl);
+
+        nk_vc_printf("phase 2: writing pattern to CXL block...\n");
+        volatile uint32_t *q = cxl_ptr;
+        uint32_t nw = (1 << 20) / 4;
+        for (uint32_t i = 0; i < nw; i++) q[i] = 0xC4C10000u ^ i;
+
+        nk_vc_printf("phase 3: freeing all blocks (%d DRAM + 1 CXL)...\n", first_cxl);
+        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); ptrs[i] = NULL; } }
+
+        nk_vc_printf("phase 4: re-allocating 16 x 1MB, checking for CXL bleed and r/w...\n");
+        int iso_ok = 1;
+        int m = 0;
+        for (m = 0; m < 16; m++) {
+            ptrs[m] = malloc(1 << 20);
+            if (!ptrs[m]) { nk_vc_printf("  OOM at re-alloc %d\n", m); iso_ok = 0; break; }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[m]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) {
+                nk_vc_printf("  re-alloc[%d]=%p: unexpected CXL address\n", m, ptrs[m]);
+                iso_ok = 0;
+            }
+            volatile uint32_t *p2 = ptrs[m];
+            for (uint32_t j = 0; j < nw; j++) p2[j] = 0xD4A20000u ^ j;
+            int rw_ok = 1;
+            for (uint32_t j = 0; j < nw; j++)
+                if (p2[j] != (0xD4A20000u ^ j)) { rw_ok = 0; break; }
+            if (!rw_ok) {
+                nk_vc_printf("  re-alloc[%d]=%p: r/w pattern FAIL\n", m, ptrs[m]);
+                iso_ok = 0;
+            }
+        }
+        nk_vc_printf("result: %s\n",
+                     iso_ok ? "OK — DRAM allocations clean after CXL free"
+                            : "FAIL — see errors above");
+        for (int i = 0; i < m; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        kmem_free(ptrs);
+        return 0;
+    }
+
     nk_vc_printf(
         "Usage:\n"
         "  cxl l                    list devices\n"
@@ -2283,6 +2393,8 @@ static int handle_cxl(char *buf, void *priv)
         "                           (default: CEDT FMW base or 0x100000000)\n"
         "  cxl mem test             direct r/w pattern test on registered CXL memory\n"
         "  cxl mem alloc            malloc 1MB and verify it comes from CXL memory\n"
+        "  cxl mem stress           alloc 1MB chunks until CXL fallback (DRAM pressure test)\n"
+        "  cxl mem isolate          alloc/free CXL memory and verify DRAM stays clean\n"
     );
     return 0;
 }
