@@ -63,5 +63,10 @@ struct buddy_pool_stats {
 
 void buddy_stats(struct buddy_mempool *mp, struct buddy_pool_stats *stats);
 
+struct buddy_mempool *
+buddy_init_alloc (ulong_t base_addr,
+                  ulong_t pool_order,
+                  ulong_t min_order,
+                  void *(*alloc_fn)(ulong_t));
 
 #endif
