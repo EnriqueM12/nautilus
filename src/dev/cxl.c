@@ -30,6 +30,7 @@
 
 #include <nautilus/nautilus.h>
 #include <nautilus/mm.h>
+#include <nautilus/numa.h>
 #include <nautilus/shell.h>
 #include <nautilus/naut_string.h>
 #include <nautilus/paging.h>
@@ -73,6 +74,7 @@
 #define PCI_CFG_CLASS          0x08
 #define PCI_CFG_HDR_TYPE       0x0c
 #define PCI_CFG_BAR0           0x10
+#define PCI_CFG_SEC_BUS        0x18   /* bits[15:8] = secondary bus number */
 #define PCI_CFG_BAR1           0x14
 #define PCI_CFG_COMMAND        0x04
 
@@ -217,6 +219,7 @@
 #define CXL_HDM_DEC_CTRL(n)        (CXL_HDM_DEC_BLK(n) + 0x10)  /* decoder control */
 #define CXL_HDM_DEC_SKIP_LO(n)     (CXL_HDM_DEC_BLK(n) + 0x14)  /* DPA skip[31:0] (type 3) */
 #define CXL_HDM_DEC_SKIP_HI(n)     (CXL_HDM_DEC_BLK(n) + 0x18)  /* DPA skip[63:32] */
+#define CXL_HDM_DEC_TGT_LO(n)      (CXL_HDM_DEC_BLK(n) + 0x14)  /* target list low — same offset as SKIP_LO; meaning differs by device type */
 
 /* Decoder Control Register fields (CXL 2.0 Table 8-23) */
 #define CXL_HDM_DEC_CTRL_IG_MASK     0x0fu          /* bits[3:0]:  interleave granularity */
@@ -275,6 +278,9 @@ struct cxl_dev {
     uint64_t         persistent_mb;
     uint32_t         lsa_size;
 
+    /* kmem region registered after HDM decoder commit (NULL if not yet registered) */
+    struct mem_region *kmem_region;
+
     struct list_head dev_node;
 };
 
@@ -330,6 +336,20 @@ static void bar0_map(uint64_t bar0, uint64_t size)
     for (uint64_t off = 0; off < size; off += 0x1000)
         nk_map_page_nocache(ROUND_DOWN_TO_PAGE(bar0 + off),
                             PTE_PRESENT_BIT | PTE_WRITABLE_BIT, PS_4K);
+}
+
+/* Map a CXL DRAM range with cached PTEs so the buddy allocator can use it.
+ * Unlike BAR0 MMIO, device memory must not be mapped uncacheable.
+ *
+ * nk_map_page (via drill_pd) always installs 2MB page-directory entries,
+ * ignoring the PS_4K hint.  Stepping in 4KB increments would overwrite the
+ * same PD entry 512 times, leaving it pointing at the last non-2MB-aligned
+ * address.  Step in 2MB increments so each call sets exactly one PD entry. */
+static void cxl_mem_map(uint64_t base, uint64_t size)
+{
+    for (uint64_t off = 0; off < size; off += 0x200000)
+        nk_map_page(base + off, base + off,
+                    PTE_PRESENT_BIT | PTE_WRITABLE_BIT, PS_4K);
 }
 
 static inline uint32_t mmio_readl(uint64_t base, uint32_t off)
@@ -397,12 +417,23 @@ static int ecam_init(void)
  * CEDT subtable type 1 = CFMWS (ACPI 6.4 Table 5-175).
  * ----------------------------------------------------------------------- */
 
+#define CEDT_SUBTABLE_CHBS   0
 #define CEDT_SUBTABLE_CFMWS  1
 
 struct cedt_subtable_hdr {
     uint8_t  type;
     uint8_t  reserved;
     uint16_t length;
+} __packed;
+
+/* CEDT CXL Host Bridge Structure (ACPI 6.4 Table 5-174) */
+struct cedt_chbs {
+    struct cedt_subtable_hdr hdr;
+    uint32_t uid;
+    uint32_t cxl_version;
+    uint32_t reserved;
+    uint64_t base;      /* base address of host bridge component registers */
+    uint64_t length;
 } __packed;
 
 struct cedt_cfmws {
@@ -420,6 +451,12 @@ struct cedt_cfmws {
 static uint64_t cedt_fmw_base = 0;
 static uint64_t cedt_fmw_size = 0;
 
+static struct numa_domain *cxl_numa_dom = NULL;
+
+#define CEDT_MAX_HBS 4
+static uint64_t cedt_hb_base[CEDT_MAX_HBS];
+static int      cedt_num_hbs = 0;
+
 static int parse_cedt(struct acpi_table_header *hdr, void *arg)
 {
     uint8_t *p   = (uint8_t *)hdr + sizeof(*hdr);
@@ -431,6 +468,15 @@ static int parse_cedt(struct acpi_table_header *hdr, void *arg)
         struct cedt_subtable_hdr *sub = (struct cedt_subtable_hdr *)p;
         if (sub->length < sizeof(*sub) || p + sub->length > end)
             break;
+
+        if (sub->type == CEDT_SUBTABLE_CHBS &&
+            sub->length >= (uint16_t)sizeof(struct cedt_chbs)) {
+            struct cedt_chbs *chbs = (struct cedt_chbs *)p;
+            INFO("CEDT CHBS: uid=%u base=0x%016llx len=0x%016llx\n",
+                 chbs->uid, chbs->base, chbs->length);
+            if (cedt_num_hbs < CEDT_MAX_HBS)
+                cedt_hb_base[cedt_num_hbs++] = chbs->base;
+        }
 
         if (sub->type == CEDT_SUBTABLE_CFMWS &&
             sub->length >= (uint16_t)sizeof(struct cedt_cfmws)) {
@@ -1165,11 +1211,79 @@ static void dump_dev(struct cxl_dev *dev)
     if (dev->total_mb)
         nk_vc_printf("  Capacity: total=%lluMB volatile=%lluMB persistent=%lluMB\n",
                      dev->total_mb, dev->volatile_mb, dev->persistent_mb);
+    if (dev->kmem_region)
+        nk_vc_printf("  kmem:   registered at 0x%016llx size=%lluMB\n",
+                     dev->kmem_region->base_addr, dev->kmem_region->len >> 20);
+    else
+        nk_vc_printf("  kmem:   not registered\n");
 }
 
 /* Default CXL FMW base: right above the 4GB main-memory ceiling.
  * Matches the QEMU run script: -M cxl-fmw.0.size=4G with 4G main RAM. */
 #define CXL_HDM_DEFAULT_HPA_BASE    0x100000000ULL
+
+/* -----------------------------------------------------------------------
+ * Host bridge HDM decoder programming
+ *
+ * Programs one decoder on the CXL host bridge (pxb-cxl) for a specific HPA
+ * sub-range, with the target set to the root port slot that leads to the
+ * endpoint.  Must be called once per endpoint, incrementing dec_idx.
+ * ----------------------------------------------------------------------- */
+
+static int cxl_program_host_bridge_decoder(int dec_idx,
+                                            uint64_t hpa_base, uint64_t hpa_size,
+                                            uint8_t target_port)
+{
+    if (cedt_num_hbs == 0) {
+        nk_vc_printf("  no CEDT CHBS — cannot program host bridge decoder\n");
+        return -1;
+    }
+
+    uint64_t hb_base = cedt_hb_base[0];
+    bar0_map(hb_base, 0x10000);
+
+    uint64_t cm = hb_base + CXL_COMP_CM_OFFSET;
+    uint32_t hdm_off = comp_cap_find(cm, CXL_COMP_CAP_ID_HDM);
+    if (!hdm_off) {
+        nk_vc_printf("  HB HDM capability not found\n");
+        return -1;
+    }
+
+    uint32_t ctrl = mmio_readl(cm, hdm_off + CXL_HDM_DEC_CTRL(dec_idx));
+    if (ctrl & CXL_HDM_DEC_CTRL_COMMITTED) {
+        nk_vc_printf("  HB decoder[%d] already committed\n", dec_idx);
+        return 0;
+    }
+
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_BASE_LO(dec_idx),
+                (uint32_t)(hpa_base & 0xf0000000u));
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_BASE_HI(dec_idx),
+                (uint32_t)(hpa_base >> 32));
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_SIZE_LO(dec_idx),
+                (uint32_t)(hpa_size & 0xf0000000u));
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_SIZE_HI(dec_idx),
+                (uint32_t)(hpa_size >> 32));
+    /* target list low: bits[3:0] = target port for 1-way interleave */
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_TGT_LO(dec_idx), target_port & 0xf);
+    mmio_writel(cm, hdm_off + CXL_HDM_DEC_CTRL(dec_idx), CXL_HDM_DEC_CTRL_COMMIT);
+
+    int committed = 0, j;
+    for (j = 0; j < 1000000; j++) {
+        ctrl = mmio_readl(cm, hdm_off + CXL_HDM_DEC_CTRL(dec_idx));
+        if (ctrl & CXL_HDM_DEC_CTRL_COMMITTED) { committed = 1; break; }
+    }
+    if (!committed) {
+        nk_vc_printf("  HB decoder[%d] commit TIMEOUT\n", dec_idx);
+        return -1;
+    }
+
+    uint32_t gctr = mmio_readl(cm, hdm_off + CXL_HDM_GLOB_CTRL);
+    mmio_writel(cm, hdm_off + CXL_HDM_GLOB_CTRL, gctr | CXL_HDM_GLOB_CTRL_ENABLE);
+
+    nk_vc_printf("  HB decoder[%d] committed: hpa=0x%016llx size=0x%016llx target=%u\n",
+                 dec_idx, hpa_base, hpa_size, target_port);
+    return 0;
+}
 
 /* -----------------------------------------------------------------------
  * HDM Decoder programming  (CXL 2.0 §8.2.4 / Table 8-23)
@@ -1423,6 +1537,8 @@ static int probe_function(uint8_t bus, uint8_t slot, uint8_t fun)
  * Init / deinit
  * ----------------------------------------------------------------------- */
 
+static void cxl_program_all_hdm(uint64_t hpa_base);
+
 int cxl_init(struct naut_info *naut)
 {
     INFO("init\n");
@@ -1456,8 +1572,14 @@ int cxl_init(struct naut_info *naut)
         }
     }
 
-    if (list_empty(&dev_list))
+    if (list_empty(&dev_list)) {
         INFO("No CXL devices found\n");
+        return 0;
+    }
+
+#ifdef NAUT_CONFIG_CXL_AUTO_INIT_HDM
+    cxl_program_all_hdm(cedt_fmw_base ? cedt_fmw_base : CXL_HDM_DEFAULT_HPA_BASE);
+#endif
 
     return 0;
 }
@@ -1471,6 +1593,143 @@ int cxl_deinit(void)
         free(dev);
     }
     return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * HDM programming — program all discovered devices and register with kmem
+ * ----------------------------------------------------------------------- */
+
+static void cxl_program_all_hdm(uint64_t hpa_base)
+{
+    struct list_head *cur;
+    int hb_dec_idx = 0;
+    struct sys_info *sys = &(nk_get_nautilus_info()->sys);
+
+    /* Create a dedicated NUMA domain for CXL memory so the allocator
+     * treats it as a remote tier, preferring DRAM first. */
+    struct numa_domain *cxl_dom = NULL;
+    unsigned cxl_dom_id = nk_get_num_domains();
+    if (cxl_dom_id < MAX_NUMA_DOMAINS) {
+        cxl_dom = kmem_malloc(sizeof(*cxl_dom));
+        if (cxl_dom) {
+            memset(cxl_dom, 0, sizeof(*cxl_dom));
+            cxl_dom->id = cxl_dom_id;
+            INIT_LIST_HEAD(&cxl_dom->regions);
+            INIT_LIST_HEAD(&cxl_dom->adj_list);
+            sys->locality_info.domains[cxl_dom_id] = cxl_dom;
+            sys->locality_info.num_domains++;
+            cxl_numa_dom = cxl_dom;
+            INFO("CXL NUMA domain %u created\n", cxl_dom_id);
+        } else {
+            ERROR("Failed to allocate CXL NUMA domain\n");
+        }
+    } else {
+        ERROR("MAX_NUMA_DOMAINS reached — CXL domain not created\n");
+    }
+
+    list_for_each(cur, &dev_list) {
+        struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+
+        if (!dev->total_mb) {
+            INFO("[%02x:%02x.%x] total_mb=0 — skipping HDM programming\n",
+                 dev->bus, dev->slot, dev->fun);
+            continue;
+        }
+
+        uint64_t hpa_size = (uint64_t)dev->total_mb << 20;
+        int is_pmem = dev->persistent_mb > 0;
+
+        /* Find the root port for this endpoint by scanning for a bridge
+         * whose secondary bus matches the device's bus number. */
+        uint8_t rp_slot = 0xff;
+        for (int r2 = 0; r2 < num_ecam_regions && rp_slot == 0xff; r2++) {
+            for (int b2 = ecam_regions[r2].start_bus;
+                 b2 <= ecam_regions[r2].end_bus && rp_slot == 0xff; b2++) {
+                for (int s2 = 0; s2 < 32 && rp_slot == 0xff; s2++) {
+                    uint32_t id2 = ecam_readl(b2, s2, 0, PCI_CFG_VENDOR);
+                    if ((id2 & 0xffff) == PCI_VENDOR_NONE) continue;
+                    uint32_t cls2 = ecam_readl(b2, s2, 0, PCI_CFG_CLASS);
+                    if (((cls2 >> 24) & 0xff) != 0x06) continue;
+                    uint8_t sec2 = (ecam_readl(b2, s2, 0, PCI_CFG_SEC_BUS) >> 8) & 0xff;
+                    if (sec2 == dev->bus)
+                        rp_slot = (uint8_t)s2;
+                }
+            }
+        }
+
+        INFO("[%02x:%02x.%x] programming decoder[0]: "
+             "hpa=0x%016llx size=0x%016llx (%lluMB) type=%s rp_slot=%u\n",
+             dev->bus, dev->slot, dev->fun,
+             hpa_base, hpa_size, dev->total_mb,
+             is_pmem ? "pmem" : "volatile",
+             rp_slot == 0xff ? 255 : rp_slot);
+
+        if (rp_slot != 0xff)
+            cxl_program_host_bridge_decoder(hb_dec_idx++, hpa_base, hpa_size, rp_slot);
+
+        if (cxl_hdm_program_decoder(dev, 0, hpa_base, hpa_size, is_pmem) == 0) {
+            struct mem_region *mr = kmem_malloc(sizeof(*mr));
+            if (!mr) {
+                ERROR("[%02x:%02x.%x] kmem_malloc for mem_region failed\n",
+                      dev->bus, dev->slot, dev->fun);
+            } else {
+                memset(mr, 0, sizeof(*mr));
+                mr->base_addr     = hpa_base;
+                mr->len           = hpa_size;
+                mr->enabled       = 1;
+                mr->hot_pluggable = 1;
+                mr->nonvolatile   = is_pmem;
+                INIT_LIST_HEAD(&mr->entry);
+                INIT_LIST_HEAD(&mr->glob_link);
+
+                cxl_mem_map(hpa_base, hpa_size);
+
+                if (kmem_create_zone(mr) < 0) {
+                    ERROR("[%02x:%02x.%x] kmem_create_zone failed\n",
+                          dev->bus, dev->slot, dev->fun);
+                    kmem_free(mr);
+                } else {
+                    kmem_add_memory(mr, hpa_base, hpa_size);
+                    dev->kmem_region = mr;
+                    INFO("[%02x:%02x.%x] registered %lluMB at 0x%016llx with kmem\n",
+                         dev->bus, dev->slot, dev->fun, hpa_size >> 20, hpa_base);
+
+                    /* Associate region with the CXL NUMA domain. */
+                    if (cxl_dom) {
+                        mr->domain_id = cxl_dom_id;
+                        list_add_tail(&mr->entry, &cxl_dom->regions);
+                        cxl_dom->addr_space_size += hpa_size;
+                        cxl_dom->num_regions++;
+                    }
+                }
+            }
+            hpa_base += hpa_size;
+        }
+    }
+
+    /* Wire CXL domain into every existing domain's adjacency list (at the
+     * tail = farthest), and wire existing domains into the CXL domain's
+     * adjacency list so distance-ordered traversal works both ways. */
+    if (cxl_dom && cxl_dom->num_regions > 0) {
+        for (unsigned i = 0; i < cxl_dom_id; i++) {
+            struct numa_domain *d = sys->locality_info.domains[i];
+            if (!d) continue;
+
+            struct domain_adj_entry *fwd = kmem_malloc(sizeof(*fwd));
+            if (fwd) {
+                fwd->domain = cxl_dom;
+                list_add_tail(&fwd->list_ent, &d->adj_list);
+            }
+
+            struct domain_adj_entry *rev = kmem_malloc(sizeof(*rev));
+            if (rev) {
+                rev->domain = d;
+                list_add_tail(&rev->list_ent, &cxl_dom->adj_list);
+            }
+        }
+        INFO("CXL NUMA domain %u: %u region(s) %lluMB wired into topology\n",
+             cxl_dom_id, cxl_dom->num_regions, cxl_dom->addr_space_size >> 20);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -1865,35 +2124,11 @@ static int handle_cxl(char *buf, void *priv)
     }
 
     if (!strncmp(buf, "cxl hdm program", 15)) {
-        /* Assign HPA windows sequentially from hpa_base.
-         * Usage: cxl hdm program [<hpa_base_hex>]
-         * Default: CEDT-discovered FMW base, or fallback constant. */
         uint64_t hpa_base = cedt_fmw_base ? cedt_fmw_base : CXL_HDM_DEFAULT_HPA_BASE;
         if (buf[15] == ' ')
             sscanf(buf + 16, "%llx", &hpa_base);
-
-        list_for_each(cur, &dev_list) {
-            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
-            count++;
-
-            if (!dev->total_mb) {
-                nk_vc_printf("[%02x:%02x.%x] total_mb=0 — run cxl identify first\n",
-                             dev->bus, dev->slot, dev->fun);
-                continue;
-            }
-
-            uint64_t hpa_size = (uint64_t)dev->total_mb << 20;
-            int is_pmem = dev->persistent_mb > 0;
-
-            nk_vc_printf("[%02x:%02x.%x] programming decoder[0]: "
-                         "hpa=0x%016llx size=0x%016llx (%lluMB) type=%s\n",
-                         dev->bus, dev->slot, dev->fun,
-                         hpa_base, hpa_size, dev->total_mb,
-                         is_pmem ? "pmem" : "volatile");
-
-            if (cxl_hdm_program_decoder(dev, 0, hpa_base, hpa_size, is_pmem) == 0)
-                hpa_base += hpa_size;   /* advance window for next device */
-        }
+        cxl_program_all_hdm(hpa_base);
+        list_for_each(cur, &dev_list) { count++; }
         if (!count) nk_vc_printf("No CXL devices\n");
         return 0;
     }
@@ -1904,6 +2139,27 @@ static int handle_cxl(char *buf, void *priv)
                          cedt_fmw_base, cedt_fmw_size);
         else
             nk_vc_printf("No CXL FMW found in CEDT (or CEDT not present)\n");
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl numa", 8)) {
+        if (!cxl_numa_dom) {
+            nk_vc_printf("CXL NUMA domain not created (run cxl hdm program first)\n");
+        } else {
+            nk_vc_printf("CXL NUMA domain %u: %u region(s) %lluMB\n",
+                         cxl_numa_dom->id, cxl_numa_dom->num_regions,
+                         cxl_numa_dom->addr_space_size >> 20);
+            struct mem_region *mr;
+            list_for_each_entry(mr, &cxl_numa_dom->regions, entry) {
+                nk_vc_printf("  base=0x%016llx len=%lluMB domain=%u\n",
+                             mr->base_addr, mr->len >> 20, mr->domain_id);
+            }
+            struct domain_adj_entry *ent;
+            nk_vc_printf("  adj_list (DRAM domains):");
+            list_for_each_entry(ent, &cxl_numa_dom->adj_list, list_ent)
+                nk_vc_printf(" %u", ent->domain->id);
+            nk_vc_printf("\n");
+        }
         return 0;
     }
 
@@ -1939,6 +2195,179 @@ static int handle_cxl(char *buf, void *priv)
         return 0;
     }
 
+    if (!strncmp(buf, "cxl mem test", 12)) {
+        list_for_each(cur, &dev_list) {
+            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+            count++;
+            if (!dev->kmem_region) {
+                nk_vc_printf("[%02x:%02x.%x] no memory registered (run cxl hdm program first)\n",
+                             dev->bus, dev->slot, dev->fun);
+                continue;
+            }
+            uint64_t base = dev->kmem_region->base_addr;
+            volatile uint32_t *p = (volatile uint32_t *)base;
+            for (uint32_t i = 0; i < 1024; i++) p[i] = 0xCEC50000u ^ i;
+            int ok = 1;
+            uint32_t fail_idx = 0, fail_got = 0, fail_exp = 0;
+            for (uint32_t i = 0; i < 1024; i++) {
+                uint32_t got = p[i];
+                if (got != (0xCEC50000u ^ i)) {
+                    ok = 0; fail_idx = i; fail_got = got;
+                    fail_exp = 0xCEC50000u ^ i; break;
+                }
+            }
+            if (ok) {
+                nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: OK\n",
+                             dev->bus, dev->slot, dev->fun, base);
+            } else {
+                nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: FAIL"
+                             " (idx=%u expected=0x%08x got=0x%08x)\n",
+                             dev->bus, dev->slot, dev->fun, base,
+                             fail_idx, fail_exp, fail_got);
+            }
+        }
+        if (!count) nk_vc_printf("No CXL devices\n");
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl mem alloc", 13)) {
+        void *ptr = malloc(1 << 20);
+        if (!ptr) {
+            nk_vc_printf("malloc(1MB) failed\n");
+            return 0;
+        }
+        struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptr);
+        int from_cxl = 0;
+        list_for_each(cur, &dev_list) {
+            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+            if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+        }
+        nk_vc_printf("malloc(1MB) -> %p  region_base=0x%llx  %s\n",
+                     ptr, r ? (unsigned long long)r->base_addr : 0ULL,
+                     from_cxl ? "FROM CXL" : "not from CXL");
+        if (from_cxl) {
+            volatile uint32_t *q = ptr;
+            uint32_t n = (1 << 20) / 4;
+            for (uint32_t i = 0; i < n; i++) q[i] = 0xA110C000u ^ i;
+            int ok = 1;
+            for (uint32_t i = 0; i < n; i++)
+                if (q[i] != (0xA110C000u ^ i)) { ok = 0; break; }
+            nk_vc_printf("  1MB pattern r/w: %s\n", ok ? "OK" : "FAIL");
+        }
+        free(ptr);
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl mem stress", 14)) {
+        /* Allocate 1MB chunks until the allocator falls back to CXL */
+#define STRESS_MAX 4096
+        void **ptrs = kmem_malloc(STRESS_MAX * sizeof(void *));
+        if (!ptrs) {
+            nk_vc_printf("failed to allocate pointer table\n");
+            return 0;
+        }
+        memset(ptrs, 0, STRESS_MAX * sizeof(void *));
+        int n = 0, first_cxl = -1;
+        nk_vc_printf("allocating 1MB chunks until CXL fallback (max %d)...\n", STRESS_MAX);
+        for (n = 0; n < STRESS_MAX; n++) {
+            ptrs[n] = malloc(1 << 20);
+            if (!ptrs[n]) {
+                nk_vc_printf("OOM at allocation %d\n", n);
+                break;
+            }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[n]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) { first_cxl = n; n++; break; }
+        }
+        if (first_cxl < 0)
+            nk_vc_printf("no CXL fallback in %d allocations (%dMB) — DRAM not exhausted or no CXL registered\n",
+                         n, n);
+        else
+            nk_vc_printf("DRAM exhausted after %d x 1MB (%dMB), first CXL ptr=%p: OK\n",
+                         first_cxl, first_cxl, ptrs[first_cxl]);
+        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        kmem_free(ptrs);
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl mem isolate", 15)) {
+        /* Verify that CXL alloc/free does not corrupt DRAM allocations */
+#define ISOLATE_MAX 4096
+        void **ptrs = kmem_malloc(ISOLATE_MAX * sizeof(void *));
+        if (!ptrs) {
+            nk_vc_printf("failed to allocate pointer table\n");
+            return 0;
+        }
+        memset(ptrs, 0, ISOLATE_MAX * sizeof(void *));
+        int n = 0, first_cxl = -1;
+        void *cxl_ptr = NULL;
+
+        nk_vc_printf("phase 1: exhausting DRAM to obtain a CXL allocation...\n");
+        for (n = 0; n < ISOLATE_MAX; n++) {
+            ptrs[n] = malloc(1 << 20);
+            if (!ptrs[n]) { nk_vc_printf("  OOM at %d\n", n); break; }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[n]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) { first_cxl = n; cxl_ptr = ptrs[n]; n++; break; }
+        }
+        if (first_cxl < 0) {
+            nk_vc_printf("  could not obtain CXL allocation — test skipped\n");
+            for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+            kmem_free(ptrs);
+            return 0;
+        }
+        nk_vc_printf("  CXL block at %p after %d DRAM allocations\n", cxl_ptr, first_cxl);
+
+        nk_vc_printf("phase 2: writing pattern to CXL block...\n");
+        volatile uint32_t *q = cxl_ptr;
+        uint32_t nw = (1 << 20) / 4;
+        for (uint32_t i = 0; i < nw; i++) q[i] = 0xC4C10000u ^ i;
+
+        nk_vc_printf("phase 3: freeing all blocks (%d DRAM + 1 CXL)...\n", first_cxl);
+        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); ptrs[i] = NULL; } }
+
+        nk_vc_printf("phase 4: re-allocating 16 x 1MB, checking for CXL bleed and r/w...\n");
+        int iso_ok = 1;
+        int m = 0;
+        for (m = 0; m < 16; m++) {
+            ptrs[m] = malloc(1 << 20);
+            if (!ptrs[m]) { nk_vc_printf("  OOM at re-alloc %d\n", m); iso_ok = 0; break; }
+            struct mem_region *r = kmem_get_region_by_addr((ulong_t)ptrs[m]);
+            int from_cxl = 0;
+            list_for_each(cur, &dev_list) {
+                struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+                if (dev->kmem_region && dev->kmem_region == r) { from_cxl = 1; break; }
+            }
+            if (from_cxl) {
+                nk_vc_printf("  re-alloc[%d]=%p: unexpected CXL address\n", m, ptrs[m]);
+                iso_ok = 0;
+            }
+            volatile uint32_t *p2 = ptrs[m];
+            for (uint32_t j = 0; j < nw; j++) p2[j] = 0xD4A20000u ^ j;
+            int rw_ok = 1;
+            for (uint32_t j = 0; j < nw; j++)
+                if (p2[j] != (0xD4A20000u ^ j)) { rw_ok = 0; break; }
+            if (!rw_ok) {
+                nk_vc_printf("  re-alloc[%d]=%p: r/w pattern FAIL\n", m, ptrs[m]);
+                iso_ok = 0;
+            }
+        }
+        nk_vc_printf("result: %s\n",
+                     iso_ok ? "OK — DRAM allocations clean after CXL free"
+                            : "FAIL — see errors above");
+        for (int i = 0; i < m; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        kmem_free(ptrs);
+        return 0;
+    }
+
     nk_vc_printf(
         "Usage:\n"
         "  cxl l                    list devices\n"
@@ -1958,9 +2387,14 @@ static int handle_cxl(char *buf, void *priv)
         "  cxl sanitize             sanitize overwrite (background op)\n"
         "  cxl security             get security state\n"
         "  cxl cedt                 show CXL FMW base from ACPI CEDT\n"
+        "  cxl numa                 show CXL NUMA domain info\n"
         "  cxl hdm                  dump HDM decoder state\n"
         "  cxl hdm program [<base>] program decoder[0] on each device\n"
         "                           (default: CEDT FMW base or 0x100000000)\n"
+        "  cxl mem test             direct r/w pattern test on registered CXL memory\n"
+        "  cxl mem alloc            malloc 1MB and verify it comes from CXL memory\n"
+        "  cxl mem stress           alloc 1MB chunks until CXL fallback (DRAM pressure test)\n"
+        "  cxl mem isolate          alloc/free CXL memory and verify DRAM stays clean\n"
     );
     return 0;
 }

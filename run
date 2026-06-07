@@ -65,8 +65,8 @@ qemu-system-x86_64 \
     \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
     \
-    -D qemu.log 
-    \xs
+    -D qemu.log \
+    \
     $@
 
 # -device cxl-type3,bus=root_port13,volatile-memdev=vmem0,id=cxl-vmem0 \

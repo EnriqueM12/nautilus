@@ -306,6 +306,40 @@ create_zone (struct mem_region * region)
     return buddy_init(pa_to_va(region->base_addr), pool_order, min_order);
 }
 
+int
+kmem_create_zone(struct mem_region *region)
+{
+    struct sys_info *sys = &(nk_get_nautilus_info()->sys);
+    ulong_t pool_order = ilog2(roundup_pow_of_two(region->len));
+    ulong_t min_order  = MIN_ORDER;
+    unsigned i;
+
+    if (region->mm_state) {
+        panic("Memory zone already exists for region at 0x%llx\n",
+              (unsigned long long)region->base_addr);
+    }
+
+    /* Initialize buddy pool first, before the region is visible to allocators. */
+    region->mm_state = buddy_init_alloc(pa_to_va(region->base_addr),
+                                        pool_order, min_order,
+                                        (void *(*)(ulong_t))kmem_malloc);
+    if (!region->mm_state)
+        return -1;
+
+    /* Now publish: add to global zone list and to every CPU's ordered list. */
+    list_add(&region->glob_link, &glob_zone_list);
+
+    for (i = 0; i < sys->num_cpus; i++) {
+        struct mem_reg_entry *ent = kmem_malloc(sizeof(*ent));
+        if (!ent)
+            continue;
+        ent->mem = region;
+        list_add_tail(&ent->mem_ent, &sys->cpus[i]->kmem.ordered_regions);
+    }
+
+    return 0;
+}
+
 
 /**
  * This adds memory to the kernel memory pool. The memory region being added
