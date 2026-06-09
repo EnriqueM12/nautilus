@@ -92,7 +92,7 @@
  * ----------------------------------------------------------------------- */
 
 #define CXL_DVSEC_REG_LOCATOR       0x0008
-#define CXL_REGLOC_BLK1_OFFSET      0x0A
+#define CXL_REGLOC_BLK1_OFFSET      0x0C
 #define CXL_REGLOC_BLK_STRIDE       0x08
 #define CXL_REGLOC_RBI_MEMDEV       3    /* CXL Device Register Interface */
 
@@ -576,27 +576,47 @@ static uint64_t ecam_bar_size(uint8_t bus, uint8_t slot, uint8_t fun, int barnum
 static int find_dri_location(uint8_t bus, uint8_t slot, uint8_t fun,
                               uint64_t *out_addr)
 {
-    /* Scan each BAR (0, 2, 4) for a Device Register Interface header.
-     * CXL 2.0 Table 8-29: the DRI array header has cap_id = 0x0000 and
-     * a non-zero count.  This avoids unaligned ECAM reads that would be
-     * needed to parse the Register Locator DVSEC (entries start at an
-     * unaligned offset, +0x0A, within the DVSEC). */
-    for (int bir = 0; bir < 6; bir += 2) {
-        uint64_t bar = ecam_bar_addr(bus, slot, fun, bir);
-        if (!bar)
-            continue;
-        nk_map_page_nocache(ROUND_DOWN_TO_PAGE(bar),
-                            PTE_PRESENT_BIT | PTE_WRITABLE_BIT, PS_4K);
-        uint64_t hdr    = mmio_readq(bar, 0);
-        uint16_t cap_id = (uint16_t)(hdr & 0xffff);
-        uint16_t count  = (uint16_t)(hdr >> 32);
-        DEBUG("  BAR%d=0x%llx: hdr=0x%016llx cap_id=0x%04x count=%u\n",
-              bir, bar, hdr, cap_id, count);
-        if (cap_id == 0x0000 && count > 0 && count <= 16) {
-            *out_addr = bar;
-            return 0;
-        }
+    /* Use the Register Locator DVSEC (ID 0x0008, CXL 2.0 §8.1.9) to find
+     * the CXL Device Register Interface (RBI=3).
+     * Block entries start at DVSEC+0x0C (DWORD-aligned), stride 8 bytes.
+     * Lower DWORD layout: bits[2:0]=BIR, bits[13:8]=RBI, bits[31:16]=offset[31:16]
+     * Upper DWORD: offset[63:32] */
+    uint32_t dvsec_off = find_cxl_dvsec(bus, slot, fun, CXL_DVSEC_REG_LOCATOR, NULL);
+    if (!dvsec_off) {
+        ERROR("[%02x:%02x.%x] Register Locator DVSEC (0x0008) not found\n",
+              bus, slot, fun);
+        return -1;
     }
+
+    uint16_t dvsec_len = ecam_readl(bus, slot, fun, dvsec_off + DVSEC_VENDOR_OFFSET) >> 20;
+    int n_entries      = (dvsec_len - CXL_REGLOC_BLK1_OFFSET) / CXL_REGLOC_BLK_STRIDE;
+
+    for (int i = 0; i < n_entries; i++) {
+        uint32_t entry_off = dvsec_off + CXL_REGLOC_BLK1_OFFSET + i * CXL_REGLOC_BLK_STRIDE;
+        uint32_t lo = ecam_readl(bus, slot, fun, entry_off);
+        uint32_t hi = ecam_readl(bus, slot, fun, entry_off + 4);
+
+        uint8_t  bir    = lo & 0x7;
+        uint8_t  rbi    = (lo >> 8) & 0x3f;
+        uint64_t offset = (lo & 0xffff0000UL) | ((uint64_t)hi << 32);
+
+        DEBUG("  regloc[%d]: bir=%u rbi=%u offset=0x%llx\n", i, bir, rbi, offset);
+
+        if (rbi != CXL_REGLOC_RBI_MEMDEV)
+            continue;
+
+        uint64_t bar = ecam_bar_addr(bus, slot, fun, bir);
+        if (!bar) {
+            ERROR("[%02x:%02x.%x] BAR%u for DRI is zero\n", bus, slot, fun, bir);
+            return -1;
+        }
+
+        *out_addr = bar + offset;
+        return 0;
+    }
+
+    ERROR("[%02x:%02x.%x] No RBI=3 (MemDev) entry in Register Locator DVSEC\n",
+          bus, slot, fun);
     return -1;
 }
 
@@ -703,14 +723,12 @@ static int mbox_send(uint64_t dri_addr, uint32_t mbox_off, uint16_t opcode,
     {
         uint32_t ctrl_pre = mmio_readl(dri_addr, mbox_off + CXL_MBOX_CTRL);
         if (ctrl_pre & CXL_MBOX_CTRL_DOORBELL) {
-            nk_vc_printf("  mbox BUSY before op=0x%04x ctrl=0x%08x\n", opcode, ctrl_pre);
             ERROR("Mailbox busy before submit (opcode 0x%04x ctrl=0x%08x)\n",
                   opcode, ctrl_pre);
             return -1;
         }
     }
 
-ready:
     /* Write input payload */
     if (in && in_len) {
         const uint32_t *src = (const uint32_t *)in;
@@ -723,24 +741,15 @@ ready:
                 (uint64_t)opcode | ((uint64_t)in_len << 16));
 
     /* Ring doorbell (32-bit CTRL register) */
-    {
-        uint64_t cmd_readback = mmio_readq(dri_addr, mbox_off + CXL_MBOX_CMD);
-        nk_vc_printf("  mbox op=0x%04x cmd_before_ring=0x%016llx\n", opcode, cmd_readback);
-    }
     mmio_writel(dri_addr, mbox_off + CXL_MBOX_CTRL, CXL_MBOX_CTRL_DOORBELL);
 
-    /* Verify the write was visible and poll until doorbell cleared */
-    {
-        uint32_t ctrl_after = mmio_readl(dri_addr, mbox_off + CXL_MBOX_CTRL);
-        nk_vc_printf("  mbox op=0x%04x ctrl_after_ring=0x%08x\n", opcode, ctrl_after);
-    }
+    /* Poll until doorbell cleared by device */
     for (int i = 0; i < CXL_MBOX_POLL_LIMIT; i++) {
         if (!(mmio_readl(dri_addr, mbox_off + CXL_MBOX_CTRL) & CXL_MBOX_CTRL_DOORBELL))
             goto done;
     }
     {
         uint32_t ctrl_to = mmio_readl(dri_addr, mbox_off + CXL_MBOX_CTRL);
-        nk_vc_printf("  mbox TIMEOUT op=0x%04x ctrl=0x%08x\n", opcode, ctrl_to);
         ERROR("Mailbox timeout (opcode 0x%04x ctrl=0x%08x)\n", opcode, ctrl_to);
     }
     return -1;
@@ -748,8 +757,7 @@ ready:
 done:;
     uint64_t status64 = mmio_readq(dri_addr, mbox_off + CXL_MBOX_STATUS);
     uint16_t rc = CXL_MBOX_STATUS_RC(status64);
-    nk_vc_printf("  mbox done op=0x%04x status=0x%016llx rc=0x%04x\n",
-                 opcode, status64, rc);
+    DEBUG("mbox op=0x%04x status=0x%016llx rc=0x%04x\n", opcode, status64, rc);
     if (rc == CXL_MBOX_RC_UNSUPPORTED || rc == CXL_MBOX_RC_INTERNAL_ERROR)
         return 1;  /* distinguishable: command not available on this device */
     if (rc != CXL_MBOX_RC_SUCCESS && rc != CXL_MBOX_RC_BG_STARTED) {
@@ -1189,6 +1197,7 @@ static const char *dvsec_id_str(uint16_t id)
     case 0x0003: return "GPF DVSEC for CXL Ports";
     case 0x0004: return "GPF DVSEC for CXL Devices";
     case 0x0007: return "PCIe DVSEC for CXL Root Ports";
+    case 0x0008: return "Register Locator DVSEC";
     case 0x000A: return "Non-CXL Function Map (v2)";
     case 0x000B: return "CXL Extensions for Ports (v2)";
     default:     return "unknown";
@@ -1770,6 +1779,54 @@ static int handle_cxl(char *buf, void *priv)
         }
         if (!count)
             nk_vc_printf("No CXL devices\n");
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl dvsec", 9)) {
+        list_for_each(cur, &dev_list) {
+            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+            count++;
+            nk_vc_printf("[%02x:%02x.%x] extended capability chain:\n",
+                         dev->bus, dev->slot, dev->fun);
+            uint32_t off = PCIE_EXT_CAP_OFFSET;
+            while (off && off < 0x1000) {
+                uint32_t hdr = ecam_readl(dev->bus, dev->slot, dev->fun, off);
+                if (!hdr || hdr == 0xffffffff)
+                    break;
+                uint16_t cap_id   = PCIE_EXT_CAP_ID(hdr);
+                uint16_t cap_ver  = (hdr >> 16) & 0xf;
+                uint32_t next_off = PCIE_EXT_CAP_NEXT(hdr);
+                if (cap_id == PCIE_EXT_CAP_ID_DVSEC) {
+                    uint32_t v        = ecam_readl(dev->bus, dev->slot, dev->fun, off + DVSEC_VENDOR_OFFSET);
+                    uint16_t vendor   = v & 0xffff;
+                    uint16_t dvsec_rev = (v >> 16) & 0xf;
+                    uint16_t dvsec_len = v >> 20;
+                    uint16_t dvsec_id  = ecam_readl(dev->bus, dev->slot, dev->fun, off + DVSEC_ID_OFFSET) & 0xffff;
+                    nk_vc_printf("  +0x%03x DVSEC vendor=0x%04x rev=%u len=%u id=0x%04x (%s)\n",
+                                 off, vendor, dvsec_rev, dvsec_len, dvsec_id, dvsec_id_str(dvsec_id));
+                    if (vendor == CXL_DVSEC_VENDOR_ID && dvsec_id == CXL_DVSEC_REG_LOCATOR) {
+                        nk_vc_printf("    raw dwords:");
+                        for (int j = 0; j < (int)(dvsec_len / 4); j++)
+                            nk_vc_printf(" [+%02x]%08x", j * 4,
+                                ecam_readl(dev->bus, dev->slot, dev->fun, off + j * 4));
+                        nk_vc_printf("\n");
+                        int n = (dvsec_len - CXL_REGLOC_BLK1_OFFSET) / CXL_REGLOC_BLK_STRIDE;
+                        for (int i = 0; i < n; i++) {
+                            uint32_t e  = off + CXL_REGLOC_BLK1_OFFSET + i * CXL_REGLOC_BLK_STRIDE;
+                            uint32_t lo = ecam_readl(dev->bus, dev->slot, dev->fun, e);
+                            uint32_t hi = ecam_readl(dev->bus, dev->slot, dev->fun, e + 4);
+                            nk_vc_printf("    block[%d]: lo=0x%08x hi=0x%08x bir=%u rbi=%u offset=0x%llx\n",
+                                         i, lo, hi, lo & 0x7, (lo >> 8) & 0x3f,
+                                         (lo & 0xffff0000UL) | ((uint64_t)hi << 32));
+                        }
+                    }
+                } else {
+                    nk_vc_printf("  +0x%03x cap=0x%04x ver=%u\n", off, cap_id, cap_ver);
+                }
+                off = next_off;
+            }
+        }
+        if (!count) nk_vc_printf("No CXL devices\n");
         return 0;
     }
 
@@ -2368,34 +2425,34 @@ static int handle_cxl(char *buf, void *priv)
         return 0;
     }
 
-    nk_vc_printf(
-        "Usage:\n"
-        "  cxl l                    list devices\n"
-        "  cxl identify             run IDENTIFY on all devices\n"
-        "  cxl diag                 dump mailbox registers\n"
-        "  cxl ts get               get timestamp\n"
-        "  cxl ts set <ns>          set timestamp (nanoseconds)\n"
-        "  cxl fwinfo               firmware update info\n"
-        "  cxl logs                 list supported logs\n"
-        "  cxl events [0-3]         get event records (0=info 1=warn 2=fail 3=fatal)\n"
-        "  cxl partition            partition info\n"
-        "  cxl lsa get              read LSA\n"
-        "  cxl lsa set <hexbytes>   write LSA\n"
-        "  cxl poison get           list poison records\n"
-        "  cxl poison inject <addr> inject poison at hex address\n"
-        "  cxl poison clear <addr>  clear poison at hex address\n"
-        "  cxl sanitize             sanitize overwrite (background op)\n"
-        "  cxl security             get security state\n"
-        "  cxl cedt                 show CXL FMW base from ACPI CEDT\n"
-        "  cxl numa                 show CXL NUMA domain info\n"
-        "  cxl hdm                  dump HDM decoder state\n"
-        "  cxl hdm program [<base>] program decoder[0] on each device\n"
-        "                           (default: CEDT FMW base or 0x100000000)\n"
-        "  cxl mem test             direct r/w pattern test on registered CXL memory\n"
-        "  cxl mem alloc            malloc 1MB and verify it comes from CXL memory\n"
-        "  cxl mem stress           alloc 1MB chunks until CXL fallback (DRAM pressure test)\n"
-        "  cxl mem isolate          alloc/free CXL memory and verify DRAM stays clean\n"
-    );
+    nk_vc_printf("Usage:\n");
+    nk_vc_printf("  cxl l                    list devices\n");
+    nk_vc_printf("  cxl identify             run IDENTIFY on all devices\n");
+    nk_vc_printf("  cxl dvsec                dump PCIe extended capability chain\n");
+    nk_vc_printf("  cxl diag                 dump mailbox registers\n");
+    nk_vc_printf("  cxl ts get               get timestamp\n");
+    nk_vc_printf("  cxl ts set <ns>          set timestamp (nanoseconds)\n");
+    nk_vc_printf("  cxl fwinfo               firmware update info\n");
+    nk_vc_printf("  cxl logs                 list supported logs\n");
+    nk_vc_printf("  cxl events [0-3]         get event records (0=info 1=warn 2=fail 3=fatal)\n");
+    nk_vc_printf("  cxl partition            partition info\n");
+    nk_vc_printf("  cxl lsa get              read LSA\n");
+    nk_vc_printf("  cxl lsa set <hexbytes>   write LSA\n");
+    nk_vc_printf("  cxl poison get           list poison records\n");
+    nk_vc_printf("  cxl poison inject <addr> inject poison at hex address\n");
+    nk_vc_printf("  cxl poison clear <addr>  clear poison at hex address\n");
+    nk_vc_printf("  cxl sanitize             sanitize overwrite (background op)\n");
+    nk_vc_printf("  cxl security             get security state\n");
+    nk_vc_printf("  cxl cedt                 show CXL FMW base from ACPI CEDT\n");
+    nk_vc_printf("  cxl numa                 show CXL NUMA domain info\n");
+    nk_vc_printf("  cxl hdm                  dump HDM decoder state\n");
+    nk_vc_printf("  cxl hdm program [<base>] program decoder[0] on each device\n");
+    nk_vc_printf("                           (default: CEDT FMW base or 0x100000000)\n");
+    nk_vc_printf("  cxl mem test             direct r/w pattern test on registered CXL memory\n");
+    nk_vc_printf("  cxl mem alloc            malloc 1MB and verify it comes from CXL memory\n");
+    nk_vc_printf("  cxl mem stress           alloc 1MB chunks until CXL fallback (DRAM pressure test)\n");
+    nk_vc_printf("  cxl mem isolate          alloc/free CXL memory and verify DRAM stays clean\n");
+    nk_vc_printf("\n");
     return 0;
 }
 
