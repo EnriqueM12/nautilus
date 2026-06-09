@@ -53,9 +53,9 @@ qemu-system-x86_64 \
     -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
     -device cxl-rp,port=1,bus=cxl.1,id=root_port14,chassis=0,slot=3 \
     -device cxl-rp,port=2,bus=cxl.1,id=root_port15,chassis=0,slot=4 \
-    -device cxl-type3,bus=root_port13,memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-pmem0,sn=01 \
-    -device cxl-type3,bus=root_port14,memdev=cxl-mem2,lsa=cxl-lsa2,id=cxl-pmem1,sn=02 \
-    -device cxl-type3,bus=root_port15,memdev=cxl-mem3,lsa=cxl-lsa3,id=cxl-pmem2,sn=03 \
+    -device cxl-type3,bus=root_port13,volatile-memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-vmem0,sn=01 \
+    -device cxl-type3,bus=root_port14,volatile-memdev=cxl-mem2,lsa=cxl-lsa2,id=cxl-vmem1,sn=02 \
+    -device cxl-type3,bus=root_port15,volatile-memdev=cxl-mem3,lsa=cxl-lsa3,id=cxl-vmem2,sn=03 \
     \
     -chardev socket,host=localhost,port=5000,id=g,server,wait=off \
     -device isa-serial,chardev=g \
