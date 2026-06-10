@@ -2253,6 +2253,17 @@ static int handle_cxl(char *buf, void *priv)
     }
 
     if (!strncmp(buf, "cxl mem test", 12)) {
+        uint64_t fixed_offsets[] = {
+            1ULL << 20,         /* 1 MB */
+            2ULL << 20,         /* 2 MB */
+            4ULL << 20,         /* 4 MB */
+            8ULL << 20,         /* 8 MB */
+            16ULL << 20,        /* 16 MB */
+            32ULL << 20,        /* 32 MB */
+            64ULL << 20,        /* 64 MB */
+            128ULL << 20,       /* 128 MB */
+        };
+        int num_offsets = sizeof(fixed_offsets) / sizeof(fixed_offsets[0]);
         list_for_each(cur, &dev_list) {
             struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
             count++;
@@ -2262,34 +2273,74 @@ static int handle_cxl(char *buf, void *priv)
                 continue;
             }
             uint64_t base = dev->kmem_region->base_addr;
-            /* Write past the first 1MB to avoid corrupting buddy allocator
-             * free-list nodes stored at the start of the region. */
-            uint64_t test_off = 1ULL << 20;
-            if (test_off + 4096 > dev->kmem_region->len) {
-                nk_vc_printf("[%02x:%02x.%x] region too small for offset test\n",
+            uint64_t region_len = dev->kmem_region->len;
+            int passes = 0, fails = 0, skipped = 0;
+            for (int t = 0; t < num_offsets; t++) {
+                uint64_t test_off = fixed_offsets[t];
+                if (test_off + 4096 > region_len) { skipped++; continue; }
+                volatile uint32_t *p = (volatile uint32_t *)(base + test_off);
+                uint32_t seed = 0xCEC50000u ^ (uint32_t)test_off;
+                for (uint32_t i = 0; i < 1024; i++) p[i] = seed ^ i;
+                int ok = 1;
+                for (uint32_t i = 0; i < 1024; i++) {
+                    if (p[i] != (seed ^ i)) { ok = 0; break; }
+                }
+                if (ok) {
+                    passes++;
+                } else {
+                    fails++;
+                    nk_vc_printf("[%02x:%02x.%x] FAIL at 0x%016llx\n",
+                                 dev->bus, dev->slot, dev->fun, base + test_off);
+                }
+            }
+            nk_vc_printf("[%02x:%02x.%x] fixed-offset 4KB r/w: %d passed, %d failed, %d skipped\n",
+                         dev->bus, dev->slot, dev->fun, passes, fails, skipped);
+        }
+        if (!count) nk_vc_printf("No CXL devices\n");
+        return 0;
+    }
+
+    if (!strncmp(buf, "cxl mem rand", 12)) {
+        list_for_each(cur, &dev_list) {
+            struct cxl_dev *dev = list_entry(cur, struct cxl_dev, dev_node);
+            count++;
+            if (!dev->kmem_region) {
+                nk_vc_printf("[%02x:%02x.%x] no memory registered (run cxl hdm program first)\n",
                              dev->bus, dev->slot, dev->fun);
                 continue;
             }
-            volatile uint32_t *p = (volatile uint32_t *)(base + test_off);
-            for (uint32_t i = 0; i < 1024; i++) p[i] = 0xCEC50000u ^ i;
-            int ok = 1;
-            uint32_t fail_idx = 0, fail_got = 0, fail_exp = 0;
-            for (uint32_t i = 0; i < 1024; i++) {
-                uint32_t got = p[i];
-                if (got != (0xCEC50000u ^ i)) {
-                    ok = 0; fail_idx = i; fail_got = got;
-                    fail_exp = 0xCEC50000u ^ i; break;
+            uint64_t base = dev->kmem_region->base_addr;
+            uint64_t safe_start = 1ULL << 20;
+            uint64_t region_len = dev->kmem_region->len;
+            if (safe_start + 4096 > region_len) {
+                nk_vc_printf("[%02x:%02x.%x] region too small\n",
+                             dev->bus, dev->slot, dev->fun);
+                continue;
+            }
+            uint64_t num_pages = (region_len - safe_start) / 4096;
+            int passes = 0, fails = 0;
+            uint64_t tsc = rdtsc();
+            for (int t = 0; t < 8; t++) {
+                uint64_t page_idx = tsc % num_pages;
+                uint64_t test_off = safe_start + page_idx * 4096;
+                volatile uint32_t *p = (volatile uint32_t *)(base + test_off);
+                uint32_t seed = 0xCEC50000u ^ (uint32_t)test_off;
+                for (uint32_t i = 0; i < 1024; i++) p[i] = seed ^ i;
+                int ok = 1;
+                for (uint32_t i = 0; i < 1024; i++) {
+                    if (p[i] != (seed ^ i)) { ok = 0; break; }
                 }
+                if (ok) {
+                    passes++;
+                } else {
+                    fails++;
+                    nk_vc_printf("[%02x:%02x.%x] FAIL at 0x%016llx\n",
+                                 dev->bus, dev->slot, dev->fun, base + test_off);
+                }
+                tsc = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
             }
-            if (ok) {
-                nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: OK\n",
-                             dev->bus, dev->slot, dev->fun, base + test_off);
-            } else {
-                nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: FAIL"
-                             " (idx=%u expected=0x%08x got=0x%08x)\n",
-                             dev->bus, dev->slot, dev->fun, base + test_off,
-                             fail_idx, fail_exp, fail_got);
-            }
+            nk_vc_printf("[%02x:%02x.%x] 8 x random 4KB r/w: %d passed, %d failed\n",
+                         dev->bus, dev->slot, dev->fun, passes, fails);
         }
         if (!count) nk_vc_printf("No CXL devices\n");
         return 0;
@@ -2456,7 +2507,8 @@ static int handle_cxl(char *buf, void *priv)
     nk_vc_printf("  cxl hdm                  dump HDM decoder state\n");
     nk_vc_printf("  cxl hdm program [<base>] program decoder[0] on each device\n");
     nk_vc_printf("                           (default: CEDT FMW base or 0x100000000)\n");
-    nk_vc_printf("  cxl mem test             direct r/w pattern test on registered CXL memory\n");
+    nk_vc_printf("  cxl mem test             fixed-offset 4KB r/w pattern test on CXL memory\n");
+    nk_vc_printf("  cxl mem rand             random-offset 4KB r/w pattern test on CXL memory\n");
     nk_vc_printf("  cxl mem alloc            malloc 1MB and verify it comes from CXL memory\n");
     nk_vc_printf("  cxl mem stress           alloc 1MB chunks until CXL fallback (DRAM pressure test)\n");
     nk_vc_printf("  cxl mem isolate          alloc/free CXL memory and verify DRAM stays clean\n");
