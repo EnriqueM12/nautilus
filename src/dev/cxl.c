@@ -2262,7 +2262,15 @@ static int handle_cxl(char *buf, void *priv)
                 continue;
             }
             uint64_t base = dev->kmem_region->base_addr;
-            volatile uint32_t *p = (volatile uint32_t *)base;
+            /* Write past the first 1MB to avoid corrupting buddy allocator
+             * free-list nodes stored at the start of the region. */
+            uint64_t test_off = 1ULL << 20;
+            if (test_off + 4096 > dev->kmem_region->len) {
+                nk_vc_printf("[%02x:%02x.%x] region too small for offset test\n",
+                             dev->bus, dev->slot, dev->fun);
+                continue;
+            }
+            volatile uint32_t *p = (volatile uint32_t *)(base + test_off);
             for (uint32_t i = 0; i < 1024; i++) p[i] = 0xCEC50000u ^ i;
             int ok = 1;
             uint32_t fail_idx = 0, fail_got = 0, fail_exp = 0;
@@ -2275,11 +2283,11 @@ static int handle_cxl(char *buf, void *priv)
             }
             if (ok) {
                 nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: OK\n",
-                             dev->bus, dev->slot, dev->fun, base);
+                             dev->bus, dev->slot, dev->fun, base + test_off);
             } else {
                 nk_vc_printf("[%02x:%02x.%x] direct r/w 4KB at 0x%016llx: FAIL"
                              " (idx=%u expected=0x%08x got=0x%08x)\n",
-                             dev->bus, dev->slot, dev->fun, base,
+                             dev->bus, dev->slot, dev->fun, base + test_off,
                              fail_idx, fail_exp, fail_got);
             }
         }
