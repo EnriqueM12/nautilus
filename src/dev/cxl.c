@@ -2354,7 +2354,7 @@ static int handle_cxl(char *buf, void *priv)
         else
             nk_vc_printf("DRAM exhausted after %d x 1MB (%dMB), first CXL ptr=%p: OK\n",
                          first_cxl, first_cxl, ptrs[first_cxl]);
-        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        for (int i = n - 1; i >= 0; i--) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
         kmem_free(ptrs);
         return 0;
     }
@@ -2385,7 +2385,7 @@ static int handle_cxl(char *buf, void *priv)
         }
         if (first_cxl < 0) {
             nk_vc_printf("  could not obtain CXL allocation — test skipped\n");
-            for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+            for (int i = n - 1; i >= 0; i--) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
             kmem_free(ptrs);
             return 0;
         }
@@ -2397,7 +2397,7 @@ static int handle_cxl(char *buf, void *priv)
         for (uint32_t i = 0; i < nw; i++) q[i] = 0xC4C10000u ^ i;
 
         nk_vc_printf("phase 3: freeing all blocks (%d DRAM + 1 CXL)...\n", first_cxl);
-        for (int i = 0; i < n; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); ptrs[i] = NULL; } }
+        for (int i = n - 1; i >= 0; i--) { if (ptrs[i]) { kmem_free(ptrs[i]); ptrs[i] = NULL; } }
 
         nk_vc_printf("phase 4: re-allocating 16 x 1MB, checking for CXL bleed and r/w...\n");
         int iso_ok = 1;
@@ -2428,7 +2428,7 @@ static int handle_cxl(char *buf, void *priv)
         nk_vc_printf("result: %s\n",
                      iso_ok ? "OK — DRAM allocations clean after CXL free"
                             : "FAIL — see errors above");
-        for (int i = 0; i < m; i++) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
+        for (int i = m - 1; i >= 0; i--) { if (ptrs[i]) { kmem_free(ptrs[i]); } }
         kmem_free(ptrs);
         return 0;
     }
